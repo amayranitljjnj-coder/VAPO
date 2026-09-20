@@ -1,0 +1,3 @@
+# Patch files necessarily contain one-character context lines for blank source
+# lines; do not interpret those as whitespace errors in this repository.
+patches/*.patch -whitespace

@@ -1,0 +1,913 @@
+diff --git a/tests/trainer/ppo/test_counterfactual_reward.py b/tests/trainer/ppo/test_counterfactual_reward.py
+new file mode 100644
+index 0000000..f468dbd
+--- /dev/null
++++ b/tests/trainer/ppo/test_counterfactual_reward.py
+@@ -0,0 +1,52 @@
++import math
++
++import torch
++
++from verl.trainer.ppo.counterfactual_reward import (
++    calibrate_from_sequence_kl,
++    counterfactual_reward_scale,
++    reverse_k3_sequence_kl,
++)
++
++
++def test_reverse_k3_is_nonnegative_masked_mean_and_detached():
++    original = torch.tensor([[0.0, -2.0, 5.0], [-1.0, -1.0, -1.0]], requires_grad=True)
++    view = torch.tensor([[-1.0, -1.0, 4.0], [-1.0, -2.0, -3.0]], requires_grad=True)
++    mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
++
++    sequence, token = reverse_k3_sequence_kl(
++        original_log_probs=original,
++        view_log_probs=view,
++        response_mask=mask,
++    )
++
++    assert torch.all(token >= 0)
++    assert torch.all(sequence >= 0)
++    assert torch.allclose(sequence[0], token[0, :2].mean())
++    assert not sequence.requires_grad
++    assert not token.requires_grad
++
++
++def test_stage_rewards_keep_wrong_answers_zero_and_respect_bounds():
++    kl = torch.tensor([0.0, 1.0, 100.0])
++    accuracy = torch.tensor([1.0, 0.0, 1.0])
++    s1 = accuracy * counterfactual_reward_scale(
++        kl, stage="stage1", coefficient=0.3, power=2.0, tau=1.0
++    )
++    s2 = accuracy * counterfactual_reward_scale(
++        kl, stage="stage2", coefficient=0.3, alpha=math.log(2.0)
++    )
++
++    assert torch.all((s1[accuracy == 1] >= 0.7) & (s1[accuracy == 1] <= 1.0))
++    assert s1[1] == 0
++    assert torch.all((s2[accuracy == 1] >= 1.0) & (s2[accuracy == 1] <= 1.3))
++    assert s2[1] == 0
++
++
++def test_calibration_uses_selected_half_saturation_quantile():
++    values = torch.tensor([1.0, 2.0, 3.0])
++    s1 = calibrate_from_sequence_kl(values, stage="stage1", quantile=0.5)
++    s2 = calibrate_from_sequence_kl(values, stage="stage2", quantile=0.5)
++
++    assert s1["tau1"] == 2.0
++    assert math.isclose(s2["alpha2"], math.log(2.0) / 2.0)
+diff --git a/verl/trainer/config/algorithm.py b/verl/trainer/config/algorithm.py
+index 5f6890c..efdba64 100644
+--- a/verl/trainer/config/algorithm.py
++++ b/verl/trainer/config/algorithm.py
+@@ -378,4 +378,7 @@ class AlgoConfig(BaseConfig):
+     rollout_correction: Optional[RolloutCorrectionConfig] = None
+     use_kl_sep: bool = True
+     use_kl_cons: bool = False
+-
++    # Detached scalar reward based on the original-view vs stage-view policy
++    # difference. Kept as a dict so experiment-specific parameters remain
++    # configurable through Hydra without expanding the core trainer schema.
++    counterfactual_reward: dict[str, Any] = field(default_factory=dict)
+diff --git a/verl/trainer/config/bips_trainer.yaml b/verl/trainer/config/bips_trainer.yaml
+index 87e69cd..e9d87f5 100644
+--- a/verl/trainer/config/bips_trainer.yaml
++++ b/verl/trainer/config/bips_trainer.yaml
+@@ -15,6 +15,19 @@ data:
+ algorithm:
+   use_kl_sep: false
+   use_kl_cons: false
++  counterfactual_reward:
++    enabled: false
++    stage: null
++    original_log_prob_key: null
++    coefficient: 0.3
++    power: 2.0
++    tau: null
++    alpha: null
++    log_ratio_clip: 20.0
++    calibration_only: false
++    calibration_quantile: 0.5
++    calibration_sample_target: 2048
++    calibration_output: null
+ 
+ actor_rollout_ref:
+   actor:
+@@ -27,4 +40,3 @@ actor_rollout_ref:
+     kl_cons_penalty_type: low_var_kl
+     kl_cons_clip: 1.0
+     kl_cons_coef: 0.01
+-
+diff --git a/verl/trainer/ppo/counterfactual_reward.py b/verl/trainer/ppo/counterfactual_reward.py
+new file mode 100644
+index 0000000..809def6
+--- /dev/null
++++ b/verl/trainer/ppo/counterfactual_reward.py
+@@ -0,0 +1,140 @@
++"""Counterfactual RLVR reward utilities.
++
++The rollout is sampled from the stage view policy q (preserved or ablated).
++For every sampled response token we also evaluate the original-view policy p.
++The reverse-k3 estimator
++
++    r * log(r) - r + 1,  r = p(a|s) / q(a|s)
++
++is pointwise non-negative and has expectation KL(p || q) over actions a~q
++at each encountered prefix.  Sequence values are response-token means so that
++response length does not silently change the reward scale.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import os
++from pathlib import Path
++
++import torch
++
++
++def reverse_k3_sequence_kl(
++    *,
++    original_log_probs: torch.Tensor,
++    view_log_probs: torch.Tensor,
++    response_mask: torch.Tensor,
++    log_ratio_clip: float = 20.0,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Return detached sequence-mean and token reverse-k3 KL estimates.
++
++    ``original_log_probs`` is log pi^o and ``view_log_probs`` is log pi^view
++    for tokens sampled from pi^view. Clipping only protects exponentiation;
++    it introduces a small estimator bias for extreme ratios.
++    """
++    if original_log_probs.shape != view_log_probs.shape:
++        raise ValueError(
++            f"log-prob shapes differ: {original_log_probs.shape=} {view_log_probs.shape=}"
++        )
++    if response_mask.shape != view_log_probs.shape:
++        raise ValueError(f"mask shape differs: {response_mask.shape=} {view_log_probs.shape=}")
++    if log_ratio_clip <= 0:
++        raise ValueError(f"log_ratio_clip must be positive, got {log_ratio_clip}")
++
++    # float64 keeps exp(d) * d - exp(d) + 1 accurate around d=0. The result is
++    # returned in float32 because it is a detached reward statistic.
++    d = (original_log_probs.double() - view_log_probs.double()).clamp(
++        min=-log_ratio_clip, max=log_ratio_clip
++    )
++    ratio = torch.exp(d)
++    token_kl = (ratio * d - ratio + 1.0).clamp_min(0.0)
++    mask = response_mask.to(dtype=token_kl.dtype)
++    sequence_kl = (token_kl * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
++    return sequence_kl.float().detach(), token_kl.float().detach()
++
++
++def counterfactual_reward_scale(
++    sequence_kl: torch.Tensor,
++    *,
++    stage: str,
++    coefficient: float,
++    power: float = 2.0,
++    tau: float | None = None,
++    alpha: float | None = None,
++) -> torch.Tensor:
++    """Compute the fixed Stage-1 or Stage-2 nonlinear reward multiplier."""
++    if not 0.0 <= coefficient <= 1.0:
++        raise ValueError(f"coefficient must be in [0, 1], got {coefficient}")
++    if stage == "stage1":
++        if tau is None or tau <= 0:
++            raise ValueError(f"Stage 1 requires tau > 0, got {tau}")
++        if power <= 1:
++            raise ValueError(f"Stage 1 requires power > 1, got {power}")
++        normalized_power = (sequence_kl / tau).clamp_min(0.0).pow(power)
++        mapped = normalized_power / (1.0 + normalized_power)
++        return (1.0 - coefficient * mapped).detach()
++    if stage == "stage2":
++        if alpha is None or alpha <= 0:
++            raise ValueError(f"Stage 2 requires alpha > 0, got {alpha}")
++        mapped = -torch.expm1(-alpha * sequence_kl.clamp_min(0.0))
++        return (1.0 + coefficient * mapped).detach()
++    raise ValueError(f"unknown counterfactual reward stage: {stage!r}")
++
++
++def calibrate_from_sequence_kl(
++    sequence_kl: torch.Tensor,
++    *,
++    stage: str,
++    quantile: float = 0.5,
++    minimum_scale: float = 1e-8,
++) -> dict[str, float | int | str | dict[str, float]]:
++    """Choose tau/alpha from a KL distribution with a recorded rule.
++
++    The selected quantile is the half-saturation point for both mappings:
++    tau = Q for Stage 1 and alpha = ln(2)/Q for Stage 2.
++    """
++    if not 0.0 < quantile < 1.0:
++        raise ValueError(f"quantile must be in (0, 1), got {quantile}")
++    values = sequence_kl.detach().double().cpu()
++    values = values[torch.isfinite(values)]
++    if values.numel() == 0:
++        raise ValueError("cannot calibrate from an empty/non-finite KL distribution")
++    qs = {
++        "q10": float(torch.quantile(values, 0.10)),
++        "q25": float(torch.quantile(values, 0.25)),
++        "q50": float(torch.quantile(values, 0.50)),
++        "q75": float(torch.quantile(values, 0.75)),
++        "q90": float(torch.quantile(values, 0.90)),
++        "q95": float(torch.quantile(values, 0.95)),
++        "q99": float(torch.quantile(values, 0.99)),
++    }
++    selected = max(float(torch.quantile(values, quantile)), minimum_scale)
++    result: dict[str, float | int | str | dict[str, float]] = {
++        "stage": stage,
++        "sample_count": int(values.numel()),
++        "selection_quantile": float(quantile),
++        "half_saturation_kl": selected,
++        "mean": float(values.mean()),
++        "std": float(values.std(unbiased=False)),
++        "min": float(values.min()),
++        "max": float(values.max()),
++        "quantiles": qs,
++    }
++    if stage == "stage1":
++        result["tau1"] = selected
++    elif stage == "stage2":
++        result["alpha2"] = math.log(2.0) / selected
++    else:
++        raise ValueError(f"unknown calibration stage: {stage!r}")
++    return result
++
++
++def write_calibration_json(path: str | os.PathLike[str], result: dict) -> None:
++    """Atomically write a calibration artifact."""
++    target = Path(path).expanduser().resolve()
++    target.parent.mkdir(parents=True, exist_ok=True)
++    temporary = target.with_name(f".{target.name}.incomplete")
++    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    os.replace(temporary, target)
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index fb6bfcf..135d9ed 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -18,6 +18,8 @@ PPO Trainer with Ray-based single controller.
+ This trainer supports model-agonistic model initialization with huggingface
+ """
+ 
++import ctypes
++import gc
+ import json
+ import os
+ import random
+@@ -48,6 +50,12 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
+ from verl.single_controller.ray.base import create_colocated_worker_cls
+ from verl.trainer.config import AlgoConfig
+ from verl.trainer.ppo import core_algos
++from verl.trainer.ppo.counterfactual_reward import (
++    calibrate_from_sequence_kl,
++    counterfactual_reward_scale,
++    reverse_k3_sequence_kl,
++    write_calibration_json,
++)
+ from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+ from verl.trainer.ppo.metric_utils import (
+     compute_data_metrics,
+@@ -67,6 +75,27 @@ from verl.utils.torch_functional import masked_mean
+ from verl.utils.tracking import ValidationGenerationsLogger
+ 
+ 
++def _release_host_memory():
++    """Return large transient Ray serialization buffers to the OS."""
++    gc.collect()
++    try:
++        ctypes.CDLL("libc.so.6").malloc_trim(0)
++    except (OSError, AttributeError):
++        pass
++
++
++def _flatten_metric_values(value):
++    """Flatten per-chunk, per-rank metric values for the standard reducer."""
++    if isinstance(value, np.ndarray):
++        value = value.tolist()
++    if isinstance(value, (list, tuple)):
++        flattened = []
++        for item in value:
++            flattened.extend(_flatten_metric_values(item))
++        return flattened
++    return [value]
++
++
+ @dataclass
+ class ResourcePoolManager:
+     """
+@@ -524,6 +553,111 @@ class RayPPOTrainer:
+         # Log to each configured logger
+         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+ 
++    def _compute_log_prob_in_chunks(self, worker_group, worker_method, batch: DataProto) -> DataProto:
++        log_prob_batch = batch.select(
++            batch_keys=["responses", "input_ids", "attention_mask", "position_ids"],
++            non_tensor_batch_keys=["multi_modal_inputs"] if "multi_modal_inputs" in batch.non_tensor_batch else [],
++        )
++        log_prob_batch.meta_info = dict(batch.meta_info)
++        chunks = int(self.config.trainer.get("log_prob_chunks", 1))
++        if chunks <= 1:
++            output = worker_method(log_prob_batch)
++            worker_group.release_host_memory()
++            del log_prob_batch
++            _release_host_memory()
++            return output
++        if len(log_prob_batch) % chunks != 0:
++            raise ValueError(f"log-prob batch size {len(log_prob_batch)} must be divisible by {chunks=}")
++
++        outputs = []
++        for chunk in log_prob_batch.chunk(chunks=chunks):
++            outputs.append(worker_method(chunk))
++            worker_group.release_host_memory()
++            _release_host_memory()
++        output = DataProto.concat(outputs)
++        del outputs, log_prob_batch
++        _release_host_memory()
++        return output
++
++    def _update_actor_in_chunks(self, batch: DataProto) -> DataProto:
++        chunks = int(self.config.trainer.get("actor_update_chunks", 1))
++        if chunks <= 1:
++            return self.actor_rollout_wg.update_actor(batch)
++
++        actor_batch_keys = [
++            "responses",
++            "response_mask",
++            "input_ids",
++            "attention_mask",
++            "position_ids",
++            "old_log_probs",
++            "advantages",
++        ]
++        optional_actor_keys = (
++            "ref_log_prob",
++            "rollout_is_weights",
++            "rollout_log_probs",
++            "sep_log_probs",
++            "cons_log_probs",
++            "token_level_rewards",
++        )
++        actor_batch_keys.extend(key for key in optional_actor_keys if key in batch.batch)
++        actor_batch = batch.select(
++            batch_keys=actor_batch_keys,
++            non_tensor_batch_keys=["multi_modal_inputs"] if "multi_modal_inputs" in batch.non_tensor_batch else [],
++        )
++        actor_batch.meta_info = dict(batch.meta_info)
++
++        world_size = self.resource_pool_manager.get_n_gpus()
++        if len(actor_batch) % world_size != 0:
++            raise ValueError(f"actor batch size {len(actor_batch)} must be divisible by {world_size=}")
++        if int(self.config.actor_rollout_ref.actor.ppo_epochs) != 1:
++            raise ValueError("chunked actor updates currently preserve ordering only for ppo_epochs=1")
++
++        local_batch_size = len(actor_batch) // world_size
++        global_mini_batch_size = (
++            int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
++            * int(self.config.actor_rollout_ref.rollout.n)
++        )
++        if global_mini_batch_size % world_size != 0:
++            raise ValueError(f"expanded PPO mini-batch {global_mini_batch_size} must divide across {world_size=}")
++        local_mini_batch_size = global_mini_batch_size // world_size
++        expected_chunks = local_batch_size // local_mini_batch_size
++        if local_batch_size % local_mini_batch_size != 0 or chunks != expected_chunks:
++            raise ValueError(
++                f"actor_update_chunks={chunks} must equal the original number of per-rank PPO mini-batches "
++                f"({expected_chunks})"
++            )
++
++        # Preserve the exact per-rank mini-batch sequence used by the unchunked
++        # dispatcher. Each call performs one of the original synchronized FSDP
++        # optimizer steps, while only the final call advances the LR scheduler.
++        rank_shards = actor_batch.chunk(chunks=world_size)
++        outputs = []
++        for mini_batch_idx in range(chunks):
++            start = mini_batch_idx * local_mini_batch_size
++            end = start + local_mini_batch_size
++            update_batch = DataProto.concat([rank_shard[start:end] for rank_shard in rank_shards])
++            update_batch.meta_info = dict(actor_batch.meta_info)
++            update_batch.meta_info["force_not_on_policy"] = chunks > 1
++            update_batch.meta_info["step_lr_scheduler"] = mini_batch_idx == chunks - 1
++            update_batch.meta_info["global_token_num"] = torch.sum(
++                update_batch.batch["attention_mask"], dim=-1
++            ).tolist()
++            outputs.append(self.actor_rollout_wg.update_actor(update_batch))
++            self.actor_rollout_wg.release_host_memory()
++            del update_batch
++            _release_host_memory()
++
++        merged_metrics = defaultdict(list)
++        for chunk_output in outputs:
++            for key, values in chunk_output.meta_info.get("metrics", {}).items():
++                merged_metrics[key].extend(_flatten_metric_values(values))
++        output = DataProto(meta_info={"metrics": dict(merged_metrics)})
++        del outputs, rank_shards, actor_batch
++        _release_host_memory()
++        return output
++
+     def _get_gen_batch(self, batch: DataProto) -> DataProto:
+         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+ 
+@@ -583,6 +717,17 @@ class RayPPOTrainer:
+             sample_gts.extend(ground_truths)
+ 
+             test_gen_batch = self._get_gen_batch(test_batch)
++            if not self.async_rollout_mode:
++                # Validation only needs the original image for generation. These
++                # tensors and auxiliary views are training inputs, not vLLM inputs.
++                for key in (
++                    "multi_modal_inputs",
++                    "pres_multi_modal_data",
++                    "pres_multi_modal_inputs",
++                    "abl_multi_modal_data",
++                    "abl_multi_modal_inputs",
++                ):
++                    test_gen_batch.non_tensor_batch.pop(key, None)
+             test_gen_batch.meta_info = {
+                 "eos_token_id": self.tokenizer.eos_token_id,
+                 "pad_token_id": self.tokenizer.pad_token_id,
+@@ -602,6 +747,7 @@ class RayPPOTrainer:
+             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+             if not self.async_rollout_mode:
+                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
++                self.actor_rollout_wg.release_host_memory()
+             else:
+                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+ 
+@@ -1020,6 +1166,7 @@ class RayPPOTrainer:
+             else False
+         )
+         next_step_profile = False
++        cf_calibration_values = []
+ 
+         for epoch in range(self.config.trainer.total_epochs):
+             if getattr(self.train_dataloader.batch_sampler, "set_epoch", None) is not None:
+@@ -1042,6 +1189,19 @@ class RayPPOTrainer:
+                 )
+ 
+                 gen_batch = self._get_gen_batch(batch)
++                if not self.async_rollout_mode:
++                    # vLLM only consumes the original multi_modal_data. Keep processed
++                    # tensors and auxiliary views on the driver until actor training.
++                    training_only_multimodal_keys = (
++                        "multi_modal_inputs",
++                        "pres_multi_modal_data",
++                        "pres_multi_modal_inputs",
++                        "abl_multi_modal_data",
++                        "abl_multi_modal_inputs",
++                    )
++                    for key in training_only_multimodal_keys:
++                        if key in gen_batch.non_tensor_batch:
++                            batch.non_tensor_batch[key] = gen_batch.non_tensor_batch.pop(key)
+ 
+                 # pass global_steps to trace
+                 gen_batch.meta_info["global_steps"] = self.global_steps
+@@ -1054,7 +1214,32 @@ class RayPPOTrainer:
+                     # generate a batch
+                     with marked_timer("gen", timing_raw, color="red"):
+                         if not self.async_rollout_mode:
+-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
++                            generation_chunks = int(self.config.trainer.get("rollout_generation_chunks", 1))
++                            if generation_chunks > 1:
++                                if len(gen_batch_output) % generation_chunks != 0:
++                                    raise ValueError(
++                                        f"rollout batch size {len(gen_batch_output)} must be divisible by "
++                                        f"trainer.rollout_generation_chunks={generation_chunks}"
++                                    )
++                                generated_chunks = []
++                                generation_timings = []
++                                for generation_chunk in gen_batch_output.chunk(chunks=generation_chunks):
++                                    chunk_output = self.actor_rollout_wg.generate_sequences(generation_chunk)
++                                    self.actor_rollout_wg.release_host_memory()
++                                    generation_timings.append(chunk_output.meta_info.pop("timing", {}))
++                                    generated_chunks.append(chunk_output)
++                                    _release_host_memory()
++                                gen_batch_output = DataProto.concat(generated_chunks)
++                                merged_generation_timing = {}
++                                for chunk_timing in generation_timings:
++                                    for key, value in chunk_timing.items():
++                                        merged_generation_timing[key] = merged_generation_timing.get(key, 0) + value
++                                gen_batch_output.meta_info["timing"] = merged_generation_timing
++                                del generated_chunks, generation_timings, generation_chunk, chunk_output
++                                _release_host_memory()
++                            else:
++                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
++                                self.actor_rollout_wg.release_host_memory()
+                         else:
+                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+ 
+@@ -1089,9 +1274,14 @@ class RayPPOTrainer:
+                             batch.batch["reward_baselines"] = reward_baseline_tensor
+ 
+                             del rm_scores, gen_baseline_batch, gen_baseline_output
++                    del gen_batch
++                    _release_host_memory()
++
+                     # repeat to align with repeated responses in rollout
+                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                     batch = batch.union(gen_batch_output)
++                    del gen_batch_output
++                    _release_host_memory()
+ 
+                     if "response_mask" not in batch.batch.keys():
+                         batch.batch["response_mask"] = compute_response_mask(batch)
+@@ -1134,7 +1324,9 @@ class RayPPOTrainer:
+                         )
+                     else:  # Recompute old_log_probs
+                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
++                            old_log_prob = self._compute_log_prob_in_chunks(
++                                self.actor_rollout_wg, self.actor_rollout_wg.compute_log_prob, batch
++                            )
+                             entropys = old_log_prob.batch["entropys"]
+                             response_masks = batch.batch["response_mask"]
+                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+@@ -1159,7 +1351,9 @@ class RayPPOTrainer:
+                             with marked_timer("sep_log_prob", timing_raw):
+                                 original_data = preprocess_aug_batch(batch, aug_data)
+                                 try:
+-                                    sep_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
++                                    sep_log_prob = self._compute_log_prob_in_chunks(
++                                        self.actor_rollout_wg, self.actor_rollout_wg.compute_log_prob, batch
++                                    )
+                                     # Rename to avoid overwriting old_log_probs
+                                     sep_log_prob.batch["sep_log_probs"] = sep_log_prob.batch.pop("old_log_probs")
+                                     if "entropys" in sep_log_prob.batch:
+@@ -1182,7 +1376,9 @@ class RayPPOTrainer:
+                             with marked_timer("cons_log_prob", timing_raw):
+                                 original_data = preprocess_aug_batch(batch, cons_data)
+                                 try:
+-                                    cons_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
++                                    cons_log_prob = self._compute_log_prob_in_chunks(
++                                        self.actor_rollout_wg, self.actor_rollout_wg.compute_log_prob, batch
++                                    )
+                                     # Rename to avoid overwriting old_log_probs
+                                     cons_log_prob.batch["cons_log_probs"] = cons_log_prob.batch.pop("old_log_probs")
+                                     if "entropys" in cons_log_prob.batch:
+@@ -1199,9 +1395,13 @@ class RayPPOTrainer:
+                         # compute reference log_prob
+                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                             if not self.ref_in_actor:
+-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
++                                ref_log_prob = self._compute_log_prob_in_chunks(
++                                    self.ref_policy_wg, self.ref_policy_wg.compute_ref_log_prob, batch
++                                )
+                             else:
+-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
++                                ref_log_prob = self._compute_log_prob_in_chunks(
++                                    self.actor_rollout_wg, self.actor_rollout_wg.compute_ref_log_prob, batch
++                                )
+                             batch = batch.union(ref_log_prob)
+ 
+                     # compute values
+@@ -1215,6 +1415,87 @@ class RayPPOTrainer:
+                         reward_extra_infos_dict: dict[str, list]
+                         if self.config.reward_model.launch_reward_fn_async:
+                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
++
++                        cf_cfg = self.config.algorithm.get("counterfactual_reward", {})
++                        if cf_cfg and cf_cfg.get("enabled", False):
++                            original_log_prob_key = cf_cfg.get("original_log_prob_key")
++                            if not original_log_prob_key or original_log_prob_key not in batch.batch:
++                                raise ValueError(
++                                    "counterfactual reward requires an original-view log-prob tensor; "
++                                    f"configured key={original_log_prob_key!r}, available={list(batch.batch.keys())}"
++                                )
++                            sequence_cf_kl, _ = reverse_k3_sequence_kl(
++                                original_log_probs=batch.batch[original_log_prob_key],
++                                view_log_probs=batch.batch["old_log_probs"],
++                                response_mask=batch.batch["response_mask"],
++                                log_ratio_clip=float(cf_cfg.get("log_ratio_clip", 20.0)),
++                            )
++                            stage = str(cf_cfg.get("stage"))
++                            reward_extra_infos_dict["counterfactual_kl"] = sequence_cf_kl.cpu().tolist()
++                            metrics.update(
++                                {
++                                    "counterfactual/kl_mean": sequence_cf_kl.mean().item(),
++                                    "counterfactual/kl_min": sequence_cf_kl.min().item(),
++                                    "counterfactual/kl_max": sequence_cf_kl.max().item(),
++                                }
++                            )
++
++                            if cf_cfg.get("calibration_only", False):
++                                calibration_output = cf_cfg.get("calibration_output")
++                                if not calibration_output:
++                                    raise ValueError("calibration_only requires calibration_output")
++                                calibration_target = int(cf_cfg.get("calibration_sample_target", 2048))
++                                if calibration_target <= 0:
++                                    raise ValueError("calibration_sample_target must be positive")
++                                cf_calibration_values.append(sequence_cf_kl.cpu())
++                                collected = sum(values.numel() for values in cf_calibration_values)
++                                print(
++                                    f"Counterfactual KL calibration: collected {collected}/{calibration_target} sequences"
++                                )
++                                if collected < calibration_target:
++                                    del batch
++                                    _release_host_memory()
++                                    continue
++                                calibration_values = torch.cat(cf_calibration_values)[:calibration_target]
++                                calibration = calibrate_from_sequence_kl(
++                                    calibration_values,
++                                    stage=stage,
++                                    quantile=float(cf_cfg.get("calibration_quantile", 0.5)),
++                                )
++                                calibration.update(
++                                    {
++                                        "estimator": "reverse_k3_rollout_token",
++                                        "direction": "D_KL(pi_original || pi_view)",
++                                        "sequence_aggregation": "response_token_mean",
++                                        "log_ratio_clip": float(cf_cfg.get("log_ratio_clip", 20.0)),
++                                        "global_step": int(self.global_steps),
++                                        "model_path": str(self.config.actor_rollout_ref.model.path),
++                                    }
++                                )
++                                write_calibration_json(calibration_output, calibration)
++                                pprint(f"Counterfactual KL calibration written to {calibration_output}: {calibration}")
++                                progress_bar.close()
++                                return
++
++                            scale = counterfactual_reward_scale(
++                                sequence_cf_kl,
++                                stage=stage,
++                                coefficient=float(cf_cfg.get("coefficient", 0.3)),
++                                power=float(cf_cfg.get("power", 2.0)),
++                                tau=cf_cfg.get("tau"),
++                                alpha=cf_cfg.get("alpha"),
++                            )
++                            # The rule reward places the outcome score on the final
++                            # response token. Multiplying the whole tensor preserves
++                            # that convention and keeps every incorrect sample at 0.
++                            reward_tensor = reward_tensor * scale.to(reward_tensor.device).unsqueeze(-1)
++                            reward_extra_infos_dict["counterfactual_reward_scale"] = scale.cpu().tolist()
++                            metrics.update(
++                                {
++                                    "counterfactual/reward_scale_mean": scale.mean().item(),
++                                    "counterfactual/reward_mean": reward_tensor.sum(dim=-1).mean().item(),
++                                }
++                            )
+                         batch.batch["token_level_scores"] = reward_tensor
+ 
+                         if reward_extra_infos_dict:
+@@ -1271,7 +1552,7 @@ class RayPPOTrainer:
+                         # update actor
+                         with marked_timer("update_actor", timing_raw, color="red"):
+                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+-                            actor_output = self.actor_rollout_wg.update_actor(batch)
++                            actor_output = self._update_actor_in_chunks(batch)
+                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                         metrics.update(actor_output_metrics)
+ 
+@@ -1336,6 +1617,10 @@ class RayPPOTrainer:
+                         "training/epoch": epoch,
+                     }
+                 )
++                for key, values in reward_extra_infos_dict.items():
++                    numeric_values = np.asarray(values)
++                    if numeric_values.size and np.issubdtype(numeric_values.dtype, np.number):
++                        metrics[f"reward_extra/{key}/mean"] = float(numeric_values.mean())
+                 # collect metrics
+                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+index 4b3d7a8..e6e003e 100644
+--- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
++++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+@@ -174,8 +174,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+                     logger=logger,
+                 )
+ 
+-        # wait for everyone to load checkpoints
+-        torch.distributed.barrier()
++        # The Ray ONE_TO_ALL checkpoint call already waits for every rank to
++        # return. Avoid a CPU/Gloo barrier here: that transport can be idle for
++        # days during GPU-only training and become stale before a resume.
++
++        # Include a resumed checkpoint in retention accounting so the next
++        # save can rotate it just like checkpoints created in this process.
++        if local_path not in self.previous_saved_paths:
++            self.previous_saved_paths.append(local_path)
+ 
+     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+         """
+@@ -201,20 +207,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+         # record the previous global step
+         self.previous_global_step = global_step
+ 
+-        # remove previous local_path, only rank 0 should do this
+-        if (
+-            self.rank == 0
+-            and max_ckpt_to_keep
+-            and isinstance(max_ckpt_to_keep, int)
+-            and max_ckpt_to_keep > 0
+-            and len(self.previous_saved_paths) >= max_ckpt_to_keep
+-        ):
+-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
+-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
+-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+-
+         local_path = local_mkdir_safe(local_path)
+-        torch.distributed.barrier()
+ 
+         # check if the checkpoint_save_contents is valid
+         if self.should_save_model:
+@@ -236,12 +229,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+ 
+                 if self.should_save_model:
+                     model_state_dict = self.model.state_dict()
+-                    torch.save(model_state_dict, model_path)
++                    model_tmp_path = f"{model_path}.incomplete"
++                    torch.save(model_state_dict, model_tmp_path)
++                    os.replace(model_tmp_path, model_path)
+                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
+ 
+                 if self.should_save_optimizer:
+                     optimizer_state_dict = self.optimizer.state_dict()
+-                    torch.save(optimizer_state_dict, optim_path)
++                    optim_tmp_path = f"{optim_path}.incomplete"
++                    torch.save(optimizer_state_dict, optim_tmp_path)
++                    os.replace(optim_tmp_path, optim_path)
+                     log_with_rank(f"Saved optim to {os.path.abspath(optim_path)}", rank=self.rank, logger=logger)
+ 
+                 if self.should_save_extra:
+@@ -250,7 +247,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+                         "lr_scheduler": lr_scheduler_state_dict,
+                         "rng": self.get_rng_state(),
+                     }
+-                    torch.save(extra_state_dict, extra_path)
++                    extra_tmp_path = f"{extra_path}.incomplete"
++                    torch.save(extra_state_dict, extra_tmp_path)
++                    os.replace(extra_tmp_path, extra_path)
+                     log_with_rank(f"Saved extra_state to {os.path.abspath(extra_path)}", rank=self.rank, logger=logger)
+ 
+         if self.rank == 0:
+@@ -300,8 +299,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+             with open(fsdp_config_path, "w") as f:
+                 json.dump(asdict(fsdp_config), f, indent=4)
+ 
+-        # wait for everyone to dump to local
+-        torch.distributed.barrier()
++        # Every rank writes a distinct atomic file. The caller waits for all
++        # Ray rank calls, so an additional CPU/Gloo barrier is unnecessary and
++        # would make checkpoint durability depend on a long-idle TCP channel.
+ 
+         if self.should_save_hf_model:
+             # Only rank 0 will save hf model and,
+@@ -361,7 +361,19 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+                 del state_dict
+                 del save_model
+ 
+-            # wait for rank0 to dump hf_model to local
+-            torch.distributed.barrier()
++            # The controller waits for rank 0 as part of the ONE_TO_ALL call.
+ 
++        # Rotate only after every rank has successfully written and synchronized.
++        # Keeping the previous checkpoint until this point makes a failed save
++        # recoverable and prevents slow deletion from blocking a save barrier.
+         self.previous_saved_paths.append(local_path)
++        if (
++            max_ckpt_to_keep
++            and isinstance(max_ckpt_to_keep, int)
++            and max_ckpt_to_keep > 0
++            and len(self.previous_saved_paths) > max_ckpt_to_keep
++        ):
++            stale_paths = self.previous_saved_paths[:-max_ckpt_to_keep]
++            if self.rank == 0:
++                self.remove_previous_save_local_path(stale_paths)
++            self.previous_saved_paths = self.previous_saved_paths[-max_ckpt_to_keep:]
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index eb8dd3f..f5c58e4 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -426,7 +426,11 @@ class DataParallelPPOActor(BasePPOActor):
+         # See PPO paper for details. https://arxiv.org/abs/1707.06347
+         mini_batches = data.split(self.config.ppo_mini_batch_size)
+ 
+-        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
++        on_policy = (
++            len(mini_batches) == 1
++            and self.config.ppo_epochs == 1
++            and not data.meta_info.get("force_not_on_policy", False)
++        )
+ 
+         metrics = {}
+         for _ in range(self.config.ppo_epochs):
+@@ -542,7 +546,7 @@ class DataParallelPPOActor(BasePPOActor):
+                             logprob=log_prob, ref_logprob=sep_log_prob, kl_penalty=kl_sep_penalty_type
+                         )
+                         sep_loss = agg_loss(loss_mat=sep_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+-                        
++
+                         # Apply clipping to sep loss if configured
+                         sep_loss_clip = getattr(self.config, 'kl_sep_clip', None)
+                         if sep_loss_clip is not None:
+@@ -551,7 +555,7 @@ class DataParallelPPOActor(BasePPOActor):
+                         policy_loss = policy_loss - sep_loss * self.config.kl_sep_coef
+                         micro_batch_metrics["actor/sep_loss"] = sep_loss.detach().item() * loss_scale_factor
+                         micro_batch_metrics["actor/sep_kl_coef"] = self.config.kl_sep_coef
+-                    
++
+                     if "cons_log_probs" in model_inputs.keys() and self.config.use_kl_cons:
+                         cons_log_prob = model_inputs["cons_log_probs"]
+                         kl_cons_penalty_type = getattr(
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index 24be389..538db8a 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -15,7 +15,9 @@
+ The main entry point to run the PPO algorithm
+ """
+ 
++import ctypes
+ import datetime
++import gc
+ import json
+ import logging
+ import os
+@@ -83,6 +85,14 @@ from verl.utils.memory_utils import aggressive_empty_cache
+ from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
+ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
+ from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
++
++
++def _release_host_memory():
++    gc.collect()
++    try:
++        ctypes.CDLL("libc.so.6").malloc_trim(0)
++    except (OSError, AttributeError):
++        pass
+ from verl.utils.py_functional import convert_to_regular_types
+ from verl.utils.ray_utils import get_event_loop
+ from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
+@@ -749,6 +759,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         self.gen_random_states = get_torch_device().get_rng_state()
+         get_torch_device().set_rng_state(self.torch_random_states)
+ 
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def release_host_memory(self):
++        """Trim host allocations after the preceding Ray RPC released its arguments."""
++        _release_host_memory()
++        return True
++
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def init_model(self):
+         from verl.workers.actor import DataParallelPPOActor
+@@ -887,7 +903,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+             lr = self.actor_lr_scheduler.get_last_lr()[0]
+             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+-            self.actor_lr_scheduler.step()
++            if data.meta_info.get("step_lr_scheduler", True):
++                self.actor_lr_scheduler.step()
+ 
+             # TODO: here, we should return all metrics
+             output = DataProto(meta_info={"metrics": metrics})
+@@ -901,6 +918,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+ 
++        del data
++        _release_host_memory()
+         return output
+ 
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+@@ -951,6 +970,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         # clear kv cache
+         get_torch_device().empty_cache()
++        del prompts
++        _release_host_memory()
+         return output
+ 
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+@@ -992,6 +1013,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
+ 
++        del data
++        _release_host_memory()
+         return output
+ 
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+@@ -1028,6 +1051,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             elif fsdp_version(self.ref_policy.actor_module) == 2:
+                 self.ref_policy.actor_module.reshard()
+ 
++        del data
++        _release_host_memory()
+         return output
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+@@ -1043,7 +1068,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         self.checkpoint_manager.save_checkpoint(
+             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+         )
+-        dist.barrier()
++
++        # Dispatch.ONE_TO_ALL is joined by the Ray controller, which waits for
++        # every rank. Do not add a CPU/Gloo barrier after saving: the Gloo
++        # channel is otherwise unused for days and may be stale at final save.
+ 
+         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
+             lora_save_path = os.path.join(local_path, "lora_adapter")

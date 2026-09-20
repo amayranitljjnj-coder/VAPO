@@ -1,0 +1,16 @@
+README.md
+chat_template.json
+config.json
+configuration.json
+generation_config.json
+merges.txt
+model-00001-of-00005.safetensors
+model-00002-of-00005.safetensors
+model-00003-of-00005.safetensors
+model-00004-of-00005.safetensors
+model-00005-of-00005.safetensors
+model.safetensors.index.json
+preprocessor_config.json
+tokenizer.json
+tokenizer_config.json
+vocab.json
