@@ -68,6 +68,29 @@ CUDA_IDS=0,1,2,3,4,5,6,7 N_GPU=8 \
   ./tools/run_counterfactual_rlvr_7b_pipeline.sh
 ```
 
+## Fast Counterfactual pilot
+
+When asked to run the short preliminary Counterfactual experiment, keep the
+complete fixed datasets and use the documented profile in
+`docs/COUNTERFACTUAL_RLVR_7B_TRAINING.md`: one epoch, rollout `n=4`, maximum
+response length 1024, and 512 calibration sequences. Use a new absolute
+`RUN_ROOT` outside the formal `counterfactual_rlvr_7b` output tree.
+
+Disable pre-training validation and set validation/checkpoint frequencies to a
+positive number larger than the total pilot steps. Do not use `-1`: that also
+disables the final validation/checkpoint in the current trainer. Preserve the
+normal Stage-1 calibration/train/merge then Stage-2 calibration/train/merge
+lineage. The pilot is a screening run and must not be reported as the formal
+five-epoch result.
+
+Before the one-epoch pilot, run the documented five-step-per-stage smoke test
+in a separate absolute `RUN_ROOT`. It must use the pilot's rollout count,
+response limit, and 512-sequence calibration so its memory and throughput are
+representative. Verify both calibration artifacts, finite training metrics,
+final checkpoints, merged models, and Stage-2 initialization. Do not require a
+measurable accuracy improvement from five steps, and never resume the
+one-epoch pilot from the smoke checkpoint or reuse its Stage-2 calibration.
+
 When asked to execute the complete comparison and no order is specified, run
 BiPS first and Counterfactual RLVR second. Run them sequentially, never on the
 same GPUs at the same time.

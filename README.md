@@ -8,8 +8,8 @@ The two experiment tracks are independent:
 
 | Track | Dataset | Method | Complete command | Output |
 |---|---|---|---|---|
-| BiPS reproduction | `BiPS_ECD_3B_filtered_v3` | Stage-1 consistency loss + Stage-2 separation loss | `./tools/run_bips_reproduction_7b_pipeline.sh` | `../training_outputs/bips_reproduction_7b/` |
-| Counterfactual RLVR | `Counterfactual_RLVR_ECD_7B_clean_v1` | Detached nonlinear KL-modulated accuracy reward | `./tools/run_counterfactual_rlvr_7b_pipeline.sh` | `../training_outputs/counterfactual_rlvr_7b/` |
+| BiPS reproduction | [`BiPS_ECD_3B_filtered_v3`](https://huggingface.co/datasets/amayranitljjnj/bips-ecd-3b-filtered-v3) | Stage-1 consistency loss + Stage-2 separation loss | `./tools/run_bips_reproduction_7b_pipeline.sh` | `../training_outputs/bips_reproduction_7b/` |
+| Counterfactual RLVR | [`Counterfactual_RLVR_ECD_7B_clean_v1`](https://huggingface.co/datasets/amayranitljjnj/counterfactual-rlvr-ecd-7b-clean-v1) | Detached nonlinear KL-modulated accuracy reward | `./tools/run_counterfactual_rlvr_7b_pipeline.sh` | `../training_outputs/counterfactual_rlvr_7b/` |
 
 ## Resources
 
@@ -120,6 +120,23 @@ python3 tools/verify_training_package.py
 ---
 
 ## Training
+
+### Fast Counterfactual RLVR pilot
+
+Before committing to the five-epoch recipe, run the documented
+five-step-per-stage smoke test and then the full-data, one-epoch pilot. Both
+use `ROLLOUT_N=4`, a 1,024-token response limit, 512 calibration sequences,
+and only final-step validation/checkpointing.
+
+The smoke test exercises Stage-1 calibration/training/merge and Stage-2
+calibration/training/merge. Smoke and pilot runs must use different dedicated
+`RUN_ROOT` paths, and the one-epoch pilot starts again from the base model.
+
+Complete commands, acceptance gates, runtime projection, and evaluation rules
+are in the
+[`Fast pilot` section](docs/COUNTERFACTUAL_RLVR_7B_TRAINING.md#8-前期快速实验配置半天至一天目标)
+of the training guide. The half-day to one-day duration is a target to verify
+on the actual machine.
 
 ### BiPS Reproduction
 

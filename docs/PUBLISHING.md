@@ -89,13 +89,13 @@ cd /mnt/sdc_data/huaming/VAPO/VAPO_program
 
 /home/huaming/miniconda3/envs/bips/bin/python \
   tools/publish_hf_training_dataset.py \
-  HF_USER/counterfactual-rlvr-ecd-7b-clean-v1 \
+  amayranitljjnj/counterfactual-rlvr-ecd-7b-clean-v1 \
   --folder ../training_data/Counterfactual_RLVR_ECD_7B_clean_v1 \
   --public
 
 /home/huaming/miniconda3/envs/bips/bin/python \
   tools/publish_hf_training_dataset.py \
-  HF_USER/bips-ecd-3b-filtered-v3 \
+  amayranitljjnj/bips-ecd-3b-filtered-v3 \
   --folder ../training_data/BiPS_ECD_3B_filtered_v3 \
   --public
 ```
@@ -110,13 +110,13 @@ cd VAPO_program
 
 HF_ENDPOINT=https://huggingface.co \
 /home/huaming/miniconda3/envs/bips/bin/hf download \
-  HF_USER/counterfactual-rlvr-ecd-7b-clean-v1 \
+  amayranitljjnj/counterfactual-rlvr-ecd-7b-clean-v1 \
   --repo-type dataset \
   --local-dir ../training_data/Counterfactual_RLVR_ECD_7B_clean_v1
 
 HF_ENDPOINT=https://huggingface.co \
 /home/huaming/miniconda3/envs/bips/bin/hf download \
-  HF_USER/bips-ecd-3b-filtered-v3 \
+  amayranitljjnj/bips-ecd-3b-filtered-v3 \
   --repo-type dataset \
   --local-dir ../training_data/BiPS_ECD_3B_filtered_v3
 

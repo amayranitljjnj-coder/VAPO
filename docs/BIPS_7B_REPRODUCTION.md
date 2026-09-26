@@ -109,7 +109,7 @@ pip install -e vendor/BiPS
 从独立的 Hugging Face 数据仓库下载本轨道数据并核验：
 
 ```bash
-HF_ENDPOINT=https://huggingface.co hf download OWNER/BIPS_3B_FILTERED_DATASET_REPOSITORY \
+HF_ENDPOINT=https://huggingface.co hf download amayranitljjnj/bips-ecd-3b-filtered-v3 \
   --repo-type dataset \
   --local-dir ../training_data/BiPS_ECD_3B_filtered_v3
 (cd ../training_data/BiPS_ECD_3B_filtered_v3 && \
@@ -190,7 +190,7 @@ checkpoint 保存 model、optimizer 和 extra state，两个阶段都另外生�
 
 ```bash
 python tools/publish_hf_training_dataset.py \
-  OWNER/BIPS_3B_FILTERED_DATASET_REPOSITORY \
+  amayranitljjnj/bips-ecd-3b-filtered-v3 \
   --folder ../training_data/BiPS_ECD_3B_filtered_v3 \
   --public
 ```
