@@ -41,6 +41,8 @@ https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct
 
 Read [`docs/COUNTERFACTUAL_RLVR_7B_TRAINING.md`](docs/COUNTERFACTUAL_RLVR_7B_TRAINING.md) and [`docs/BIPS_7B_REPRODUCTION.md`](docs/BIPS_7B_REPRODUCTION.md) before running the experiments.
 
+Post-pilot evaluation, IDK diagnostics, and the independent Stage-2 mixed-training plan (pending execution; no results yet) are in [`docs/POST_PILOT_EVALUATION_AND_STAGE2_MIX.md`](docs/POST_PILOT_EVALUATION_AND_STAGE2_MIX.md).
+
 Publishing instructions are in [`docs/PUBLISHING.md`](docs/PUBLISHING.md).
 
 Coding agents should also follow [`AGENTS.md`](AGENTS.md).
