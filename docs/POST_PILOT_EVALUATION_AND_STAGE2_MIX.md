@@ -11,37 +11,56 @@ IDK 诊断或混合训练结果，也不预设混合训练一定有效。当前 
 
 ## 1. 固定模型与执行顺序
 
-先登记三个评测对象的精确路径、checkpoint step、权重哈希和来源：
+先登记四个评测对象的精确路径、checkpoint step、权重哈希和来源：
 
 - **base**：原始 `Qwen2.5-VL-7B-Instruct`。
 - **pilot Stage-1**：本次 Counterfactual RLVR pilot 的 Stage-1 checkpoint。
 - **pilot Stage-2**：同一 pilot 从上述 Stage-1 初始化得到的 Stage-2 checkpoint。
+- **BiPS 7B**：本仓库独立 BiPS 7B reproduction 轨道的最终 Stage-2 模型，
+  保留其 Stage-1 → Stage-2 的 checkpoint lineage 与数据版本记录。
 
 不将 pilot 名称自动映射为其他完整训练运行的 checkpoint，不跨轨道使用权重。
-完成三个模型的八基准评测及冻结成对测试集诊断后，再从 **pilot Stage-1 checkpoint**
+完成上述模型的八基准评测及冻结成对测试集诊断后，再从 **pilot Stage-1 checkpoint**
 启动独立的 Stage-2 混合训练；不能从 pilot Stage-2 或 BiPS checkpoint 启动。
 本文仅记录安排，不启动训练或生成派生数据。
 
 ## 2. 八基准评测
 
-三个 checkpoint 使用相同评测协议：固定每个基准的版本、split、题目列表、
-prompt、图像预处理、解码参数、随机种子、答案提取和官方判分规则。
-协议可按基准适配，但同一基准的三个模型必须一致，不能按模型调整提示或判分。
+**基准与评测规则应尽可能对应 BiPS 的评测基准和协议。** 执行前核对 BiPS 论文、
+官方评测代码及配置，登记来源版本，逐项确认下列八基准的任务版本、split、
+题目范围、prompt、图像预处理、解码参数、随机种子、答案提取和判分规则。
+对可取得的 BiPS 设置优先沿用；无法对应或必须调整的部分，明确记录差异及原因。
+
+若 BiPS 未提供某项基准或某项协议细节，由我们在评测前自行决断并冻结配置，
+记录选择依据。不能根据某个 checkpoint 的结果事后调整规则。
+协议可按基准适配，但同一基准的所有 checkpoint 必须使用相同数据、题目列表及
+评测规则，包括 base、pilot Stage-1、pilot Stage-2、BiPS 7B 和未来混合训练模型。
 固定失败、空输出和无法解析答案的计分方式，并计入总题数。
+
+**无论最终采用哪些基准和规则，都必须在同一协议下实际评测 BiPS 7B 模型，
+与其他 checkpoint 的结果一起对比。** 不能用 BiPS 论文中的数字代替本次统一评测；
+若基准或规则后续发生变更，应对所有参与比较的 checkpoint 重新评测，
+不能将不同协议的结果混在同一对比中。
 
 下表逐项填写准确率（%），模型间差值以百分点（pp）报告；
 “待评测”是占位标记，不是零分或测量结果。
 
-| 基准 | base | pilot Stage-1 | pilot Stage-2 | Stage-1 − base | Stage-2 − base | Stage-2 − Stage-1 |
-|---|---|---|---|---|---|---|
-| CharXiv | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
-| ChartQAPro | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
-| ChartMuseum | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
-| EvoChart | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
-| MathVista | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
-| MathVision | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
-| MathVerse-VO | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
-| MMStar | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+| 基准 | base | pilot Stage-1 | pilot Stage-2 | BiPS 7B | Stage-1 − base | Stage-2 − base | Stage-2 − Stage-1 |
+|---|---|---|---|---|---|---|---|
+| CharXiv | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+| ChartQAPro | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+| ChartMuseum | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+| EvoChart | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+| MathVista | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+| MathVision | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+| MathVerse-VO | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+| MMStar | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 | 待评测 |
+
+最终报告还须逐基准列出 `BiPS 7B − base`、`pilot Stage-1 − BiPS 7B`、
+`pilot Stage-2 − BiPS 7B` 的差值；若混合训练模型进入八基准复评，
+将其准确率及相对 base、pilot Stage-1、pilot Stage-2、BiPS 7B 的差值一并列出。
+BiPS 与 Counterfactual RLVR 使用不同方法和不同训练数据，因此共同对比应表述为
+**两个配置实验的比较**，不能作为方法单变量的受控消融。
 
 保留所有逐题预测，至少记录 benchmark/split、题目 ID、模型标识、GT、原始输出、
 提取答案、是否正确及运行错误。归档评测配置、样本清单、模型哈希和代码 commit，
@@ -63,7 +82,9 @@ prompt、图像预处理、解码参数、随机种子、答案提取和官方�
 题目文本不同认定独立；保存去重审计记录和最终样本 manifest/hash。
 混合训练派生集也须通过同样的隔离检查。
 
-三个 checkpoint 在同一冻结集合及同一协议上均评测。设冻结题目数为 `N`，报告：
+base、pilot Stage-1、pilot Stage-2 和 BiPS 7B 在同一冻结集合及同一协议上均评测。
+BiPS 未提供的成对视图诊断规则也应事先冻结，并统一用于后续混合训练 checkpoint。
+设冻结题目数为 `N`，报告：
 
 | 指标 | 定义（分母均为 N） |
 |---|---|
